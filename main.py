@@ -9,20 +9,21 @@ import config
 load_dotenv()
 
 
-def ask_ollama(prompt):
+def ask_ollama(prompt, temperature=config.TEMPERATURE):
     response = ollama.chat(
         model=config.OLLAMA_MODEL,
         messages=[{"role": "user", "content": prompt}],
         options={
-            "temperature": config.TEMPERATURE,
+            "temperature": temperature,
             "num_predict": config.MAX_TOKENS,
+            "num_ctx": config.OLLAMA_NUM_CTX,
             "stop": config.STOP_SEQUENCES,
         },
     )
     return response["message"]["content"]
 
 
-def ask_gemini(prompt, retries=3):
+def ask_gemini(prompt, temperature=config.TEMPERATURE, retries=3):
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     for attempt in range(1, retries + 1):
         try:
@@ -30,7 +31,7 @@ def ask_gemini(prompt, retries=3):
                 model=config.GEMINI_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=config.TEMPERATURE,
+                    temperature=temperature,
                     max_output_tokens=config.MAX_TOKENS,
                     stop_sequences=config.STOP_SEQUENCES,
                 ),
