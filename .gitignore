@@ -2,3 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+rag/*.pdf
+rag/embeddings.bin
+rag/chunks.json
+rag/vectors.db
