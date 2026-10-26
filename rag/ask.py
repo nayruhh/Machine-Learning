@@ -1,118 +1,106 @@
-﻿# Ask a question about the PDF: search vectors.db, then have an LLM answer
-# using only the matching chunks.
-# Requirements: pip install sqlite-vec numpy requests
-# Usage: python ask.py "your question here"
-#        (OPENROUTER_API_KEY must be set in the same window)
+﻿# Ask a question about all your documents: search knowledge.db for the most
+# relevant chunks (from any file), then have the LLM answer using only those.
+#
+# Usage:
+#   uv run rag/ask.py "your question"
+#   uv run rag/ask.py "your question" --show-prompt   also print what is sent to the LLM
+#   uv run rag/ask.py "your question" --search        only show the matching chunks (no LLM)
+#   uv run rag/ask.py --list                          list the files in the store
 
-import os, sys, json, time, sqlite3
-import numpy as np
-import requests
-import sqlite_vec
+import sys, argparse
 
-# Settings
-HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, "vectors.db")
-LLM_MODEL = "nvidia/nemotron-3.5-lightning:free"   # any OpenRouter chat model works
-TOP_K = 4               # how many chunks to give the LLM
-SHOW_SOURCES = True     # print which chunks/pages were used
+from rag_common import DB_PATH, TOP_K, embed_texts, chat, open_db, to_blob
 
-from dotenv import load_dotenv
-load_dotenv()
-
-from dotenv import load_dotenv
-load_dotenv()
-
-API_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not API_KEY:
-    sys.exit('OPENROUTER_API_KEY is not set. In PowerShell run:  $env:OPENROUTER_API_KEY="your-key"')
-
-HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+SYSTEM_PROMPT = """You answer questions using ONLY the numbered sources provided.
+The sources are excerpts from different documents, which may cover different topics.
+Rules:
+- Use only the sources that are relevant to the question; ignore the others.
+- Cite every fact with its source number, like [Source 2].
+- If the sources do not contain the answer, say clearly that the documents do not cover it.
+  Do not answer from your own knowledge.
+- Be clear and concise."""
 
 
-def post(url, payload, retries=5):
-    """POST to OpenRouter, retrying when the free models are busy."""
-    for attempt in range(retries):
-        try:
-            r = requests.post(url, headers=HEADERS, json=payload, timeout=120)
-            if r.status_code == 200:
-                return r.json()
-            print(f"HTTP {r.status_code}: {r.text[:200]}")
-        except requests.RequestException as e:
-            print(f"Request error: {e}")
-        wait = 2 ** attempt
-        print(f"Retrying in {wait}s...")
-        time.sleep(wait)
-    sys.exit("Request failed after several retries. Try again in a few minutes.")
-
-
-# ---------- 1. Retrieve: find the chunks closest to the question ----------
-def retrieve(question, k=TOP_K):
-    db = sqlite3.connect(DB_PATH)
-    db.enable_load_extension(True)
-    sqlite_vec.load(db)
-    db.enable_load_extension(False)
-
-    info = dict(db.execute("SELECT key, value FROM info").fetchall())
-    embed_model, dims = info["model"], int(info["dims"])
-
-    # Embed the question with the SAME model and dims as the stored chunks
-    data = post("https://openrouter.ai/api/v1/embeddings",
-                {"model": embed_model, "input": [question]})
-    q = np.array(data["data"][0]["embedding"], dtype=np.float32)[:dims]
-    q /= np.linalg.norm(q)
-
-    rows = db.execute(
-        """
-        WITH matches AS (
+def search(db, question, k):
+    q = embed_texts([question])[0]
+    rows = db.execute("""
+        WITH knn AS (
             SELECT rowid, distance FROM vec_chunks
             WHERE embedding MATCH ? AND k = ?
         )
-        SELECT chunks.id, chunks.pages, chunks.text, matches.distance
-        FROM matches JOIN chunks ON chunks.id = matches.rowid
-        ORDER BY matches.distance
-        """,
-        [q.tobytes(), k],
-    ).fetchall()
-    db.close()
-
-    return [{"id": cid, "pages": json.loads(pages), "text": text,
-             "similarity": 1 - dist ** 2 / 2}
-            for cid, pages, text, dist in rows]
+        SELECT knn.distance, files.path, chunks.location, chunks.text
+        FROM knn
+        JOIN chunks ON chunks.id = knn.rowid
+        JOIN files  ON files.id = chunks.file_id
+        ORDER BY knn.distance
+    """, (to_blob(q), k)).fetchall()
+    # Vectors are normalized, so distance d relates to cosine similarity: cos = 1 - d^2 / 2
+    return [(1 - d * d / 2, path, loc, text) for d, path, loc, text in rows]
 
 
-# ---------- 2. Augment: build the prompt from the chunks + question ----------
-def build_messages(question, chunks):
-    context = "\n\n".join(
-        f"[Source {i} | pages {', '.join(map(str, c['pages']))}]\n{c['text']}"
-        for i, c in enumerate(chunks, 1)
-    )
-    system = (
-        "You answer questions about a document using ONLY the sources provided. "
-        "If the sources do not contain the answer, say you could not find it in the document. "
-        "Cite the sources you used like [Source 1]. Be concise."
-    )
-    user = f"Sources:\n\n{context}\n\nQuestion: {question}"
-    return [{"role": "system", "content": system},
-            {"role": "user", "content": user}]
+def build_prompt(question, results):
+    sources = "\n\n".join(
+        f"[Source {i}] (file: {path}, {loc})\n{text}"
+        for i, (_, path, loc, text) in enumerate(results, 1))
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"SOURCES:\n\n{sources}\n\nQUESTION: {question}"},
+    ]
 
 
-# ---------- 3. Generate: have the LLM answer ----------
-def generate(messages):
-    data = post("https://openrouter.ai/api/v1/chat/completions",
-                {"model": LLM_MODEL, "messages": messages, "temperature": 0.2})
-    return data["choices"][0]["message"]["content"]
+def list_files(db):
+    rows = db.execute("SELECT path, file_type, chunks, added FROM files ORDER BY path").fetchall()
+    if not rows:
+        print("The store is empty. Add files to rag/documents and run: uv run rag/ingest.py")
+        return
+    for path, ftype, n, added in rows:
+        print(f"{path:50} {ftype:5} {n:4} chunks   added {added}")
+    print(f"\n{len(rows)} files, {sum(r[2] for r in rows)} chunks")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Ask questions about your documents")
+    parser.add_argument("question", nargs="*")
+    parser.add_argument("--k", type=int, default=TOP_K, help="how many chunks to use")
+    parser.add_argument("--search", action="store_true", help="only show matching chunks")
+    parser.add_argument("--show-prompt", action="store_true", help="print the prompt sent to the LLM")
+    parser.add_argument("--list", action="store_true", help="list files in the store")
+    args = parser.parse_args()
+
+    if not DB_PATH.exists():
+        sys.exit("knowledge.db not found. First run: uv run rag/ingest.py")
+    db = open_db()
+
+    if args.list:
+        list_files(db)
+        return
+    if not args.question:
+        sys.exit('Usage: uv run rag/ask.py "your question"')
+    if db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0:
+        sys.exit("The store is empty. Add files to rag/documents and run: uv run rag/ingest.py")
+
+    question = " ".join(args.question)
+    results = search(db, question, args.k)
+
+    if args.search:
+        for i, (sim, path, loc, text) in enumerate(results, 1):
+            print(f"[{i}] {path} | {loc} | similarity {sim:.3f}")
+            print(f"    {text[:300]}...\n")
+        return
+
+    messages = build_prompt(question, results)
+    if args.show_prompt:
+        print("=== Prompt sent to the LLM ===\n")
+        for m in messages:
+            print(f"--- {m['role']} ---\n{m['content']}\n")
+
+    print("=== Answer ===\n")
+    print(chat(messages))
+
+    print("\n=== Sources used ===")
+    for i, (sim, path, loc, _) in enumerate(results, 1):
+        print(f"[Source {i}] {path} | {loc} | similarity {sim:.3f}")
 
 
 if __name__ == "__main__":
-    question = " ".join(sys.argv[1:]) or input("Question: ")
-
-    chunks = retrieve(question)
-    answer = generate(build_messages(question, chunks))
-
-    print("\n=== Answer ===\n")
-    print(answer)
-
-    if SHOW_SOURCES:
-        print("\n=== Sources used ===")
-        for i, c in enumerate(chunks, 1):
-            print(f"[Source {i}] chunk {c['id']} | pages {c['pages']} | similarity {c['similarity']:.3f}")
+    main()
