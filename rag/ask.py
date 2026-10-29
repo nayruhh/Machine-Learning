@@ -15,14 +15,15 @@ SYSTEM_PROMPT = """You answer questions using ONLY the numbered sources provided
 The sources are excerpts from different documents, which may cover different topics.
 Rules:
 - Use only the sources that are relevant to the question; ignore the others.
-- Cite every fact with its source number, like [Source 2].
+- Cite every fact with its source number, like [Source 2]. Use only these labels,
+  never author names or references that appear inside the sources.
 - If the sources do not contain the answer, say clearly that the documents do not cover it.
   Do not answer from your own knowledge.
 - Be clear and concise."""
 
 
 def search(db, question, k):
-    q = embed_texts([question])[0]
+    q = embed_texts([question], is_query=True)[0]
     rows = db.execute("""
         WITH knn AS (
             SELECT rowid, distance FROM vec_chunks
@@ -68,7 +69,7 @@ def main():
     args = parser.parse_args()
 
     if not DB_PATH.exists():
-        sys.exit("knowledge.db not found. First run: uv run rag/ingest.py")
+        sys.exit(f"{DB_PATH.name} not found. First run: uv run rag/ingest.py")
     db = open_db()
 
     if args.list:

@@ -10,7 +10,7 @@
 import sys, csv, hashlib, argparse
 from datetime import datetime
 
-from rag_common import (DOCS_DIR, DB_PATH, CHUNK_WORDS, OVERLAP_WORDS,
+from rag_common import (DOCS_DIR, DB_PATH, CHUNK_WORDS, OVERLAP_WORDS, BACKEND, EMBED_MODEL,
                         embed_texts, open_db, to_blob)
 
 
@@ -195,9 +195,10 @@ def main():
 
     if args.rebuild and DB_PATH.exists():
         DB_PATH.unlink()
-        print("Deleted old knowledge.db")
+        print(f"Deleted old {DB_PATH.name}")
 
     DOCS_DIR.mkdir(exist_ok=True)
+    print(f"Embedding model: {EMBED_MODEL} ({'local, Ollama' if BACKEND == 'ollama' else 'online, OpenRouter'}) -> {DB_PATH.name}")
     db = open_db()
 
     on_disk = {}
