@@ -16,8 +16,12 @@
 #   uv run rag/ask_crag.py "your question"
 #   uv run rag/ask_crag.py "your question" --trace        show every grading decision
 #   uv run rag/ask_crag.py "your question" --show-prompt  print the prompt sent to the LLM
+#   uv run rag/ask_crag.py --chat                         interactive chat with follow-up questions
+#   (--session, --sessions, --show and --forget work as in ask.py; see memory.py)
 #
-# ask.py (the original, naive RAG) is unchanged, so both can be compared on the same questions.
+# ask.py (the original, naive RAG) answers the same way as before, so both can be compared
+# on the same questions. Follow-ups are rewritten into a stand-alone question first,
+# and that question is what gets retrieved and graded.
 
 import sys, re, json, argparse
 
@@ -27,6 +31,7 @@ from rag_common import (DB_PATH, CANDIDATES, MAX_CONTEXT, MIN_SIMILARITY, MAX_EX
                         EXTRA_PER_QUERY, PER_FILE, MAX_GRADED, GRADER_TEMPERATURE, GRADING,
                         REFERENCE_THRESHOLD, embed_texts, chat, open_db, to_blob)
 from ask import build_prompt
+import memory
 
 NOT_COVERED = "The documents do not cover this question. No relevant passages were found."
 
@@ -342,22 +347,15 @@ def corrective_retrieve(db, question, log):
     return relevant2, ("CORRECTED" if g2["sufficient"] else "PARTIAL"), g2["missing"]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Ask questions with Corrective RAG")
-    parser.add_argument("question", nargs="*")
-    parser.add_argument("--trace", action="store_true", help="show every grading decision")
-    parser.add_argument("--show-prompt", action="store_true", help="print the prompt sent to the LLM")
-    args = parser.parse_args()
-
-    if not DB_PATH.exists():
-        sys.exit(f"{DB_PATH.name} not found. First run: uv run rag/ingest.py")
-    if not args.question:
-        sys.exit('Usage: uv run rag/ask_crag.py "your question"')
-    db = open_db()
-    question = " ".join(args.question)
+def answer(db, question, turns, args):
+    """Answer one question (a follow-up if turns holds earlier ones), print it, and
+    return (answer, sources, standalone question) for the chat memory."""
+    standalone = memory.rewrite_question(question, turns)
+    if standalone != question:
+        print(f"(searching for: {standalone})\n")
 
     log = Log()
-    chunks, status, missing = corrective_retrieve(db, question, log)
+    chunks, status, missing = corrective_retrieve(db, standalone, log)
 
     print(f"=== Corrective step: {status} ===")
     for line in log:
@@ -367,7 +365,7 @@ def main():
     if not chunks:
         print("\n=== Answer ===\n")
         print(NOT_COVERED)
-        return
+        return NOT_COVERED, [], standalone
 
     # 4. Answer from the relevant chunks only, most similar to the question first.
     # Chunks found by a new query get their similarity to the ORIGINAL question,
@@ -377,24 +375,58 @@ def main():
             c["sim"] = similarity_to(db, log.qvec, c["id"])
     chunks = sorted(chunks, key=lambda c: -c["sim"])[:MAX_CONTEXT]
     results = [(c["sim"], c["path"], c["loc"], c["text"]) for c in chunks]
-    messages = build_prompt(question, results)
+    messages = build_prompt(standalone, results)
     if status == "PARTIAL":
         gap = f" Likely missing: {missing}." if missing else ""
         messages[1]["content"] += ("\n\nNOTE: the search could not find everything." + gap +
                                    " Answer what the sources support and say clearly "
                                    "which parts the documents do not cover.")
+    memory.add_history_to_prompt(messages, turns)
     if args.show_prompt:
         print("\n=== Prompt sent to the LLM ===\n")
         for m in messages:
             print(f"--- {m['role']} ---\n{m['content']}\n")
 
+    reply = chat(messages)
     print("\n=== Answer ===\n")
-    print(chat(messages))
+    print(reply)
 
     print("\n=== Sources used ===")
     for i, c in enumerate(chunks, 1):
         found = "" if c["via"] == "question" else f" | found by {c['via']}"
         print(f"[Source {i}] {c['path']} | {c['loc']} | similarity {c['sim']:.3f}{found}")
+    return reply, [f"{c['path']} | {c['loc']}" for c in chunks], standalone
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Ask questions with Corrective RAG")
+    parser.add_argument("question", nargs="*")
+    parser.add_argument("--trace", action="store_true", help="show every grading decision")
+    parser.add_argument("--show-prompt", action="store_true", help="print the prompt sent to the LLM")
+    memory.add_memory_args(parser)
+    args = parser.parse_args()
+
+    if memory.handle_memory_commands(args):
+        return
+    if not DB_PATH.exists():
+        sys.exit(f"{DB_PATH.name} not found. First run: uv run rag/ingest.py")
+    if not args.question and not args.chat:
+        sys.exit('Usage: uv run rag/ask_crag.py "your question"   (or --chat)')
+    db = open_db()
+
+    if args.chat:
+        memory.run_chat(lambda q, turns: answer(db, q, turns, args), "crag",
+                        args.session or "default")
+        return
+
+    question = " ".join(args.question)
+    if not args.session:
+        answer(db, question, [], args)      # no memory: answered on its own, not saved
+        return
+    mem = memory.open_memory()
+    sid = memory.get_session(mem, args.session)
+    reply, sources, standalone = answer(db, question, memory.recent_turns(mem, sid), args)
+    memory.save_turn(mem, sid, question, standalone, reply, sources, "crag")
 
 
 if __name__ == "__main__":

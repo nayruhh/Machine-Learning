@@ -73,8 +73,50 @@ question -> retrieve 10 chunks -> GRADER: which are relevant? is every part answ
 | PARTIAL | Some relevant chunks were found, but part of the answer is still missing; the answer says which part |
 | NOT FOUND | No relevant chunk at all; the system says the documents don't cover the question |
 
-Cost: 2-3 LLM calls per question instead of 1 (one or two grading calls plus the answer),
-so it is slower than `ask.py`. If the grader's reply can't be read, it falls back to plain RAG.
+Before grading, chunks that look like reference lists (dense with years, DOIs and URLs) are
+dropped without asking the LLM. With local models, each remaining chunk is graded with its own
+short yes/no question, because a small model judges one passage at a time far more reliably
+than ten at once.
+
+Cost: with local models about 10-15 short grading calls plus the answer per question
+(roughly 1-3 minutes on a laptop CPU); with online models 2-3 calls. If a grader reply
+can't be read, that chunk is kept (or, in batch mode, it falls back to plain RAG).
+
+## Chat memory (`memory.py`)
+
+Both `ask.py` and `ask_crag.py` can remember a conversation, so you can ask follow-up
+questions and look back at earlier answers.
+
+```powershell
+uv run rag/ask_crag.py --chat                     # chat in the "default" conversation
+uv run rag/ask_crag.py --chat --session thesis    # continue (or start) "thesis"
+```
+
+Inside the chat, type a question, `/history` to show the conversation so far,
+`/new` to start a fresh one, or `/exit` to quit. Everything is saved.
+
+How follow-ups work:
+
+1. The last 3 questions and answers of the conversation are read from `rag\chat_history.db`.
+2. The LLM rewrites the follow-up into a stand-alone question, because the search
+   only finds chunks for words that are in the question. For example, "how much does it
+   cost?" becomes "How much does the Tesla Model Y battery pack cost?". The rewritten
+   question is shown as `(searching for: ...)`.
+3. That question is searched (and, in `ask_crag.py`, graded) as usual. The conversation is
+   added to the answer prompt as background only: facts and citations still come from the
+   sources.
+
+Notes:
+
+- **One-off questions don't use memory.** `uv run rag/ask.py "question"` without `--chat`
+  or `--session` answers on its own and saves nothing, so evaluation runs stay repeatable.
+- **History lives in its own file**, `rag\chat_history.db`, so `ingest.py --rebuild`
+  never deletes it. Both scripts and both backends share it, and each saved answer
+  records which system and model wrote it. Delete the file to clear all history.
+- **Follow-ups cost one extra LLM request** (the rewrite). The first question of a
+  conversation doesn't, because there's nothing to rewrite yet.
+- **Settings** are at the top of `memory.py`: `MEMORY_TURNS` (how many earlier turns are
+  used, default 3) and `MAX_ANSWER_CHARS` (how much of each earlier answer goes in the prompt).
 
 ## Supported file types
 
@@ -147,6 +189,12 @@ uv run rag/ask.py "What is the Consolidated Fund?"
 | `uv run rag/ask_crag.py "question"` | Answer with Corrective RAG (grades and corrects the search first) |
 | `uv run rag/ask_crag.py "question" --trace` | Also show which chunks the grader kept and dropped in each round |
 | `uv run rag/ask_crag.py "question" --show-prompt` | Also print the full prompt sent to the LLM |
+| `uv run rag/ask.py --chat` (or `ask_crag.py --chat`) | Interactive chat that remembers earlier questions |
+| `uv run rag/ask.py --chat --session NAME` | Continue or start the conversation NAME |
+| `uv run rag/ask.py "follow-up" --session NAME` | Ask one question inside a saved conversation |
+| `uv run rag/ask.py --sessions` | List saved conversations |
+| `uv run rag/ask.py --show NAME` | Print a saved conversation with its sources |
+| `uv run rag/ask.py --forget NAME` | Delete a saved conversation |
 
 ## Example output
 
@@ -188,6 +236,8 @@ it says the documents don't cover it.
 | `PER_FILE` | `2` | Corrective RAG: chunks per document for questions about several documents |
 | `MAX_GRADED` | `16` | Corrective RAG: most chunks shown to the grader at once |
 | `GRADER_TEMPERATURE` | `0.0` | Corrective RAG: grading should be consistent |
+| `GRADING` | `per_chunk` (local) / `batch` (online) | Corrective RAG: grade each chunk with its own yes/no question, or all chunks in one call |
+| `REFERENCE_THRESHOLD` | `12` | Corrective RAG: chunks with at least this many citation markers per 100 words are treated as reference lists and dropped |
 
 **After changing `EMBED_MODEL`, `DIMS`, `CHUNK_WORDS` or `OVERLAP_WORDS`,
 run `uv run rag/ingest.py --rebuild`**, because questions must be embedded
